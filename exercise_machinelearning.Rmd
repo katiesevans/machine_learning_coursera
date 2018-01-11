@@ -1,0 +1,172 @@
+---
+title: "exercise_machinelearning"
+author: "Katie Evans"
+date: "1/9/2018"
+output: html_document
+---
+
+#Summary
+In this report, I am analyzing a dataset found [here](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har) on identifying how correct someone performs a weight lifting exercise using wearable sensors. I used a model that was able to predict with ~96% accuracy which activity was being performed.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(caret)
+library(gbm)
+
+#load training and testing data
+train <- read.csv("~/Downloads/pml-training.csv", strip.white = TRUE, na.strings = c("NA", "#DIV/0!", ""))
+testing <- read.csv("~/Downloads/pml-testing.csv", strip.white = TRUE, na.strings = c("NA", "#DIV/0!", ""))
+
+#load in boost model because it takes a long time to run
+load("~/Desktop/model_gmb.RData")
+load("~/Desktop/new_model_gmb.RData")
+load("~/Desktop/model_tree.RData")
+load("~/Desktop/pca_model.RData")
+
+#create cross-validation set to test models
+set.seed(565)
+validationSet <- createDataPartition(train$classe, p = 0.6, list = FALSE)
+training <- train[validationSet,]
+cv <- train[-validationSet,]
+```
+
+#Tidy the data
+The dataset contains 160 variables, which is a lot! To try to decrease the number of variables used in the model, I want to first remove variables that I am not interested in such as the name of the user. I next want to find variables that are constant across the dataset (little variance) because if there is no variation in a variable, it is probably not going to be a good predictor of the classe. I also removed variables that were 90% NA because there was more missing information than helpful information.
+
+```{r}
+
+#first check for variables with near zero variation, probably not interesting
+#also remove X, username, timestamps, and windows because this is not important to the model
+Nsv <- nearZeroVar(training, saveMetrics = TRUE)
+Nsv$activity <- rownames(Nsv)
+Nsvs <- Nsv %>%
+    filter(nzv == TRUE)
+newtrain <- training %>%
+    dplyr::select(-c(X, user_name, raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp, new_window, num_window),
+                  -one_of(Nsvs$activity))
+
+#Adjust for NA values by removing variables that are mostly NA, not going to be helpful
+nas <- as.data.frame(sapply(newtrain, function(y) sum(is.na(y))/nrow(newtrain)))
+colnames(nas) <- "perc"
+nas$activity <- rownames(nas)
+nas <- nas %>%
+    dplyr::filter(perc < 0.5)
+newertrain <- newtrain %>%
+    dplyr::select(one_of(nas$activity))
+
+#convert int to numeric
+newertrain[,-53] <- sapply(newertrain[,-53], as.numeric)
+
+```
+
+#Explore the data
+After the data tidying steps above, I am left with a cleaned dataset of 52 predictor variables for the outcome classe. This is still quite a few variables, but our algorithms can determine which ones are most important. Let's plot a few to get an idea of which variables might be important to help us predict classe. Some variables look like they don't change, but others like roll_dumbbell and roll_forearm could be useful. Let's build a model with all of these predictors first.
+
+```{r, fig.width= 8, fig.height = 10}
+#look at the variables that can be used as predictors
+names(newertrain)
+
+#plot predictors by classe
+plotdf <- newertrain %>%
+    tidyr::gather(-classe, key = var, value = val)
+ggplot(data = plotdf, aes(x = classe, y = val)) +
+    geom_boxplot()+
+    facet_wrap(~ var, nrow = 11, ncol = 5, scales = "free")
+
+```
+
+#Model prediction
+Lets try a few basic models and see what the accuracy is like. I wanted to try PCA because we have so many variables and I figured they might be related to each other and we could instead find main principal components that best explained the data, however the accuracy is only about 50% and it cannot very well distinguish between the five classes.
+
+```{r, eval=FALSE}
+#Try PCA because there are still so many variables
+#cannot use method = glm for categorical variables with more than 2 classes!
+pca_model <- train(classe ~ ., method = "multinom", preProc = "pca", data = newertrain)
+```
+
+```{r}
+confusionMatrix(cv$classe, predict(pca_model, cv))
+#pca is surprisingly not very good. accuracy is only 50% and cannot really distinguish classes
+
+```
+
+I next thought I would try the tree model. This model also does not work very well, in fact it failed completely at finding classe D. Although it is very good at identifying class E! Below is the confusion matrix as well as a plot of the tree
+
+```{r, eval = F}
+#try rpart
+model_tree <- train(classe ~ ., method = "rpart", data = newertrain)
+```
+
+```{r}
+model_tree$finalModel
+confusionMatrix(cv$classe, predict(model_tree, cv))
+#tree model not very good because does not find D at all, but almost always is accurate with E
+
+#plot tree
+plot(model_tree$finalModel, uniform = TRUE)
+text(model_tree$finalModel, use.n = TRUE, all = TRUE, cex = 0.8)
+
+```
+
+Lastly, I wanted to try a boosting model, because it seemed like this model is very popular and accurate. It took a while to run, but in the end it had about 96% accuracy which is pretty good! Much better than the other models tried. I predict that the out of sample error is close to the 4% error rate I found with the cross-validation data set, but maybe higher. The in-sample error rate is less, about 3%, which makes sense because I maximized the model by minimizing the error in the training set. Below I also plotted the true classes on the y axis by the index number, colored by the predicted class. You can see that the model does quite well.
+
+```{r, eval = F}
+#try boosting model - this line is commented out because it takes a long time to run so the model was run once then saved.
+model_gmb <- train(classe ~ ., method = "gbm", data = newertrain, verbose = FALSE)
+```
+
+```{r, fig.width=7, fig.height=5}
+confusionMatrix(newertrain$classe, predict(model_gmb, newertrain))
+confusionMatrix(cv$classe, predict(model_gmb, cv))
+#boosting is a great model! 96% accuracy and you can really tell which class is the correct one, although there are a few errors
+
+cv_test <- cbind(cv, prediction = predict(model_gmb, cv)) %>%
+    dplyr::mutate(correct = ifelse(prediction == classe, TRUE, FALSE))
+cv_test$correct <- factor(cv_test$correct, levels = c(TRUE, FALSE))
+
+ggplot(data = cv_test, aes(x = classe, y = prediction)) +
+    geom_jitter(aes(color = prediction), width = 0.3)
+
+```
+
+I also wanted to see what variables were actually important in predicting the model. To do this, I used the varImp() function and plotted the results, seen below. `roll_belt` was the most important factor followed by `pitch_forearm`, `yaw_belt`, `magnet_dumbbell_z`, and `magnet_dumbbell_y`. Can we cut down on the number of variables used in the model to get higher precision? the first 5 variables make up over 50% of the importance, what does the model look like with only them? 
+
+```{r, fig.width =7, fig.height = 7}
+#look at variable importance
+variable.importances <- varImp(model_gmb)
+plot(variable.importances)
+
+vi <- variable.importances$importance 
+vi$activity <- rownames(vi)
+vi <- vi %>%
+    dplyr::mutate(sum = Overall / sum(Overall)) %>%
+    dplyr::arrange(desc(sum)) %>%
+    dplyr::filter(sum > 0.05)
+
+#train the model with only 5 variables
+newdf <- newertrain %>%
+    dplyr::select(classe, one_of(vi$activity))
+```
+
+```{r, eval = F}
+new_model_gmb <- train(classe ~ ., method = "gbm", data = newertrain, verbose = FALSE)
+```
+
+```{r}
+confusionMatrix(newertrain$classe, predict(new_model_gmb, newertrain))
+confusionMatrix(cv$classe, predict(new_model_gmb, cv))
+
+```
+
+In this case the accuracy did not change much, showing that these 5 variables are driving almost all of the prediction.
+
+#Test the model
+We can then use this model to predict the test dataframe. Answers not shown here, for the quiz.
+
+```{r, eval = F}
+
+confusionMatrix(testing$classe, predict(model_gmb, testing))
+
+```
